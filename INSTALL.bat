@@ -142,10 +142,10 @@ echo %YELLOW%[4/5]%RESET% Creating desktop shortcut...
 
 set "SHORTCUT=%USERPROFILE%\Desktop\Pattern Pilot.lnk"
 set "TARGET=%~dp0run.bat"
-set "ICON=%~dp0app.ico"
+set "SCRIPT_DIR=%~dp0"
 
-:: Create shortcut using PowerShell
-powershell -Command "$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('%SHORTCUT%'); $s.TargetPath = '%TARGET%'; $s.WorkingDirectory = '%~dp0'; $s.Description = 'Pattern Pilot - Financial Analysis'; $s.Save()" >nul 2>&1
+:: Create shortcut using PowerShell script
+powershell -ExecutionPolicy Bypass -File "%SCRIPT_DIR%create_shortcut.ps1" -ShortcutPath "%SHORTCUT%" -TargetPath "%TARGET%" -WorkingDir "%SCRIPT_DIR%" >nul 2>&1
 
 if exist "%SHORTCUT%" (
     echo %GREEN%   Desktop shortcut created%RESET%
