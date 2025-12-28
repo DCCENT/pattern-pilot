@@ -136,9 +136,26 @@ if %errorlevel% equ 0 (
     echo %GREEN%   All dependencies installed%RESET%
 )
 
-:: Step 4: Launch the app
+:: Step 4: Create desktop shortcut
 echo.
-echo %YELLOW%[4/4]%RESET% Starting Pattern Pilot...
+echo %YELLOW%[4/5]%RESET% Creating desktop shortcut...
+
+set "SHORTCUT=%USERPROFILE%\Desktop\Pattern Pilot.lnk"
+set "TARGET=%~dp0run.bat"
+set "ICON=%~dp0app.ico"
+
+:: Create shortcut using PowerShell
+powershell -Command "$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('%SHORTCUT%'); $s.TargetPath = '%TARGET%'; $s.WorkingDirectory = '%~dp0'; $s.Description = 'Pattern Pilot - Financial Analysis'; $s.Save()" >nul 2>&1
+
+if exist "%SHORTCUT%" (
+    echo %GREEN%   Desktop shortcut created%RESET%
+) else (
+    echo %YELLOW%   Could not create shortcut (non-critical)%RESET%
+)
+
+:: Step 5: Launch the app
+echo.
+echo %YELLOW%[5/5]%RESET% Starting Pattern Pilot...
 echo.
 echo %GREEN%========================================%RESET%
 echo %GREEN%   Setup complete! Launching app...    %RESET%
