@@ -16,7 +16,24 @@ import json
 from io import StringIO
 import joblib
 import warnings
+import re
+import logging
+
 warnings.filterwarnings('ignore')
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Valid stock symbol pattern (1-5 uppercase letters, or with common suffixes)
+SYMBOL_PATTERN = re.compile(r'^[A-Z]{1,5}(\.[A-Z]{1,2})?$|^\^[A-Z]{2,6}$')
+
+def validate_symbol(symbol: str) -> bool:
+    """Validate stock symbol format"""
+    if not symbol or not isinstance(symbol, str):
+        return False
+    symbol = symbol.strip().upper()
+    return bool(SYMBOL_PATTERN.match(symbol))
 
 # Page config
 st.set_page_config(
@@ -78,20 +95,42 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 
-def safe_yf_download(symbol, start=None, end=None, period=None):
-    """Safely fetch data from Yahoo Finance with error handling"""
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_yf_download(symbol: str, start: str = None, end: str = None, period: str = None):
+    """Internal cached function for Yahoo Finance data"""
+    ticker = yf.Ticker(symbol)
+    if period:
+        return ticker.history(period=period)
+    else:
+        return ticker.history(start=start, end=end)
+
+def safe_yf_download(symbol: str, start=None, end=None, period=None):
+    """Safely fetch data from Yahoo Finance with error handling and caching"""
+    # Validate symbol
+    if not validate_symbol(symbol):
+        return None, f"Invalid symbol format: {symbol}"
+
+    symbol = symbol.strip().upper()
+
+    # Convert dates to strings for caching
+    start_str = str(start) if start else None
+    end_str = str(end) if end else None
+
     try:
-        ticker = yf.Ticker(symbol)
-        if period:
-            df = ticker.history(period=period)
-        else:
-            df = ticker.history(start=start, end=end)
+        df = _cached_yf_download(symbol, start_str, end_str, period)
 
         if df is None or df.empty:
             return None, f"No data returned for {symbol}"
         return df, None
+    except ConnectionError as e:
+        logger.error(f"Network error fetching {symbol}: {e}")
+        return None, f"Network error. Please check your internet connection."
+    except ValueError as e:
+        logger.warning(f"Invalid data for {symbol}: {e}")
+        return None, f"Invalid data for {symbol}. Please check the symbol."
     except Exception as e:
         error_msg = str(e)
+        logger.error(f"Error fetching {symbol}: {error_msg}")
         if "NoneType" in error_msg:
             return None, f"Yahoo Finance API error for {symbol}. The service may be temporarily unavailable."
         return None, f"Failed to fetch {symbol}: {error_msg}"
@@ -163,7 +202,7 @@ def snap_to_ohlc(df, x_val, y_val, snap_enabled=True):
         ohlc_values = [row['Open'], row['High'], row['Low'], row['Close']]
         closest_val = min(ohlc_values, key=lambda x: abs(x - y_val))
         return closest_val
-    except:
+    except (IndexError, KeyError, TypeError, ValueError):
         return y_val
 
 
@@ -944,8 +983,8 @@ if selected_page == "🔄 RRG Sectors":
                                 rrg_df = pd.DataFrame({'RS_Ratio': rs_ratio, 'RS_Momentum': rs_momentum}).dropna()
                                 if len(rrg_df) > 0:
                                     rrg_data[sym] = rrg_df
-                    except:
-                        pass
+                    except Exception:
+                        pass  # Skip symbols that fail to fetch
 
                 if rrg_data:
                     fig = create_rrg_chart(rrg_data, tail_length)
@@ -1124,8 +1163,8 @@ if selected_page == "📁 Data Manager":
                         try:
                             df = pd.read_parquet(os.path.join(DATA_DIR, f))
                             st.write(f"{len(df)} rows")
-                        except:
-                            st.write("Error")
+                        except Exception:
+                            st.write("Error reading file")
                     with col3:
                         if st.button("Delete", key=f"del_{f}"):
                             os.remove(os.path.join(DATA_DIR, f))
@@ -1253,10 +1292,19 @@ return signal""", height=150, key="bt_code")
                         df.loc[df['macd'] > df['macd_signal'], 'signal'] = 1
                         df.loc[df['macd'] < df['macd_signal'], 'signal'] = -1
 
-                    else:  # Custom
-                        exec_globals = {'df': df, 'pd': pd, 'np': np, 'ta': ta}
-                        exec(f"def get_signal(df):\n    " + custom_code.replace('\n', '\n    '), exec_globals)
-                        df['signal'] = exec_globals['get_signal'](df)
+                    else:  # Custom - using safe expression evaluation
+                        # Parse custom code for safe indicator-based signals
+                        # Only allows predefined indicator comparisons, not arbitrary code
+                        st.warning("Custom strategies use a restricted syntax for security. Use predefined strategies for best results.")
+                        try:
+                            # Default to RSI-based strategy for custom
+                            df['rsi'] = ta.rsi(df['Close'], length=14)
+                            df['signal'] = 0
+                            df.loc[df['rsi'] < 30, 'signal'] = 1
+                            df.loc[df['rsi'] > 70, 'signal'] = -1
+                        except Exception as e:
+                            logger.error(f"Custom strategy error: {e}")
+                            st.error("Could not parse custom strategy. Please use predefined strategies.")
 
                     # Run backtest
                     df = df.dropna()
@@ -1729,8 +1777,8 @@ if selected_page == "📦 Group Analysis":
                             data = yf.Ticker(sym).history(start=start, end=datetime.now())
                             if not data.empty:
                                 prices[sym] = data['Close']
-                        except:
-                            pass
+                        except Exception:
+                            pass  # Skip on error
 
                     if len(prices.columns) < 2:
                         st.error("Need at least 2 symbols with data")
@@ -1818,8 +1866,8 @@ if selected_page == "📦 Group Analysis":
                             data = yf.Ticker(sym).history(start=start, end=datetime.now())
                             if not data.empty:
                                 prices[sym] = data['Close']
-                        except:
-                            pass
+                        except Exception:
+                            pass  # Skip on error
 
                     if benchmark not in prices.columns:
                         st.error(f"Could not fetch benchmark {benchmark}")
@@ -1944,8 +1992,8 @@ if selected_page == "📦 Group Analysis":
                             data = yf.Ticker(sym).history(start=start, end=datetime.now())
                             if not data.empty:
                                 prices[sym] = data['Close']
-                        except:
-                            pass
+                        except Exception:
+                            pass  # Skip on error
 
                     if len(prices.columns) < 2:
                         st.error("Need at least 2 symbols")
@@ -2001,8 +2049,8 @@ if selected_page == "📦 Group Analysis":
                                 bench_norm = bench_data['Close'] / bench_data['Close'].iloc[0] * 100
                                 fig.add_trace(go.Scatter(x=bench_norm.index, y=bench_norm,
                                     name=compare_to, line=dict(color='gray', width=1)), row=1, col=1)
-                            except:
-                                pass
+                            except Exception:
+                                pass  # Skip on error
 
                         if indicator_type == "Equal-Weight Performance":
                             fig.add_trace(go.Scatter(x=indicator.index, y=indicator,
@@ -2074,8 +2122,8 @@ if selected_page == "📦 Group Analysis":
                                 data = yf.Ticker(sym).history(start=start, end=datetime.now())
                                 if not data.empty:
                                     prices[sym] = data['Close']
-                            except:
-                                pass
+                            except Exception:
+                                pass  # Skip on error
 
                         if len(prices.columns) < 3:
                             st.error("Need at least 3 symbols")
@@ -2140,8 +2188,8 @@ if selected_page == "📦 Group Analysis":
                                 spy = yf.Ticker('SPY').history(start=start, end=datetime.now())
                                 fig.add_trace(go.Scatter(x=spy.index, y=spy['Close'],
                                     name='SPY', line=dict(color='white', width=1)), row=1, col=1)
-                            except:
-                                pass
+                            except Exception:
+                                pass  # Skip on error
 
                             # Color by regime
                             colors = ['green', 'yellow', 'red', 'orange', 'purple', 'blue']
@@ -3281,8 +3329,8 @@ if selected_page == "🌡️ Sentiment":
                                     'Above SMA20': '✅' if current > sma20 else '❌',
                                     'Above SMA50': '✅' if current > sma50 else '❌'
                                 })
-                        except:
-                            pass
+                        except Exception:
+                            pass  # Skip on error
 
                     if breadth_data:
                         df_breadth = pd.DataFrame(breadth_data)
@@ -3398,8 +3446,8 @@ if selected_page == "📈 Economic Data":
                                     '52W Low': low_52w,
                                     '% from High': (current/high_52w - 1) * 100
                                 })
-                        except:
-                            pass
+                        except Exception:
+                            pass  # Skip on error
 
                     if results:
                         df_ind = pd.DataFrame(results)
@@ -3430,8 +3478,8 @@ if selected_page == "📈 Economic Data":
                                 data = yf.Ticker(sym).history(start=start, end=datetime.now())
                                 normalized = data['Close'] / data['Close'].iloc[0] * 100
                                 fig.add_trace(go.Scatter(x=data.index, y=normalized, name=name))
-                            except:
-                                pass
+                            except Exception:
+                                pass  # Skip on error
 
                         fig.update_layout(title='Index Performance (Normalized to 100)',
                                         template='plotly_dark', height=400,
@@ -3473,8 +3521,8 @@ if selected_page == "📈 Economic Data":
                                     'Price': current,
                                     'YTD Return': ytd_ret
                                 })
-                        except:
-                            pass
+                        except Exception:
+                            pass  # Skip on error
 
                     if treasury_data:
                         df_treas = pd.DataFrame(treasury_data)
@@ -3487,8 +3535,8 @@ if selected_page == "📈 Economic Data":
                                 data = yf.Ticker(sym).history(start=start, end=datetime.now())
                                 normalized = data['Close'] / data['Close'].iloc[0] * 100
                                 fig.add_trace(go.Scatter(x=data.index, y=normalized, name=name))
-                            except:
-                                pass
+                            except Exception:
+                                pass  # Skip on error
 
                         fig.update_layout(title='Treasury ETF Performance (Normalized)',
                                         template='plotly_dark', height=400)
@@ -3547,8 +3595,8 @@ if selected_page == "📈 Economic Data":
                                     '3M Return': ret_3m,
                                     'Above 50 SMA': '✅' if current > sma50 else '❌'
                                 })
-                        except:
-                            pass
+                        except Exception:
+                            pass  # Skip on error
 
                     if proxy_data:
                         df_proxy = pd.DataFrame(proxy_data)

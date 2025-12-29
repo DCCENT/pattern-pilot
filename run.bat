@@ -16,8 +16,31 @@ if not exist "venv\Scripts\streamlit.exe" (
     exit /b
 )
 
-:: Activate and run
+:: Verify core dependencies are working
 call venv\Scripts\activate.bat
+python -c "import streamlit; import yfinance; import pandas" >nul 2>&1
+if %errorlevel% neq 0 (
+    echo.
+    echo Dependencies need to be reinstalled...
+    echo.
+    pip install -r requirements.txt
+    if %errorlevel% neq 0 (
+        echo ERROR: Failed to install dependencies
+        pause
+        exit /b 1
+    )
+)
+
+:: Check if port 8501 is already in use
+netstat -ano | findstr ":8501" >nul 2>&1
+if %errorlevel% equ 0 (
+    echo.
+    echo WARNING: Port 8501 is already in use.
+    echo Another instance may be running. Close it first.
+    echo.
+    pause
+    exit /b 1
+)
 
 echo.
 echo Starting Pattern Pilot...

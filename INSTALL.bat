@@ -98,6 +98,24 @@ pause
 exit /b 1
 
 :python_found
+:: Validate Python version (need 3.10+)
+for /f "tokens=1,2 delims=." %%a in ("!PYTHON_VERSION!") do (
+    set "PY_MAJOR=%%a"
+    set "PY_MINOR=%%b"
+)
+if !PY_MAJOR! lss 3 (
+    echo %RED%ERROR: Python 3.10+ required, found !PYTHON_VERSION!%RESET%
+    echo Please install Python 3.10 or higher from https://www.python.org/downloads/
+    pause
+    exit /b 1
+)
+if !PY_MAJOR! equ 3 if !PY_MINOR! lss 10 (
+    echo %RED%ERROR: Python 3.10+ required, found !PYTHON_VERSION!%RESET%
+    echo Please install Python 3.10 or higher from https://www.python.org/downloads/
+    pause
+    exit /b 1
+)
+
 :: Step 2: Create virtual environment
 echo.
 echo %YELLOW%[2/4]%RESET% Setting up virtual environment...
@@ -126,10 +144,17 @@ if %errorlevel% equ 0 (
     echo %GREEN%   Dependencies already installed%RESET%
 ) else (
     echo        Installing dependencies (this may take a few minutes)...
-    pip install --upgrade pip --quiet
-    pip install -r requirements.txt --quiet
+    pip install --upgrade pip
     if %errorlevel% neq 0 (
+        echo %RED%ERROR: Failed to upgrade pip%RESET%
+        pause
+        exit /b 1
+    )
+    pip install -r requirements.txt
+    if %errorlevel% neq 0 (
+        echo.
         echo %RED%ERROR: Failed to install dependencies%RESET%
+        echo Please check your internet connection and try again.
         pause
         exit /b 1
     )
@@ -153,9 +178,21 @@ if exist "%SHORTCUT%" (
     echo %YELLOW%   Could not create shortcut (non-critical)%RESET%
 )
 
-:: Step 5: Launch the app
+:: Step 5: Check port and launch the app
 echo.
 echo %YELLOW%[5/5]%RESET% Starting Pattern Pilot...
+
+:: Check if port 8501 is already in use
+netstat -ano | findstr ":8501" >nul 2>&1
+if %errorlevel% equ 0 (
+    echo.
+    echo %YELLOW%WARNING: Port 8501 is already in use.%RESET%
+    echo Another instance of Pattern Pilot may be running.
+    echo Close that instance first, or the app may fail to start.
+    echo.
+    timeout /t 3 /nobreak >nul
+)
+
 echo.
 echo %GREEN%========================================%RESET%
 echo %GREEN%   Setup complete! Launching app...    %RESET%
