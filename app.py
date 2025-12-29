@@ -23,7 +23,6 @@ import json
 from io import StringIO
 import joblib
 import warnings
-import re
 import logging
 
 warnings.filterwarnings('ignore')
@@ -32,15 +31,24 @@ warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Valid stock symbol pattern (1-5 uppercase letters, or with common suffixes)
-SYMBOL_PATTERN = re.compile(r'^[A-Z]{1,5}(\.[A-Z]{1,2})?$|^\^[A-Z]{2,6}$')
+# Import configuration constants
+from config import (
+    CHART_CONFIG, DRAWING_COLORS, LINE_STYLES,
+    FIBONACCI_RATIOS, FIBONACCI_COLORS,
+    SECTOR_ETFS, SECTOR_COLORS, CHART_COLORS, CACHE_TTL
+)
 
-def validate_symbol(symbol: str) -> bool:
-    """Validate stock symbol format"""
-    if not symbol or not isinstance(symbol, str):
-        return False
-    symbol = symbol.strip().upper()
-    return bool(SYMBOL_PATTERN.match(symbol))
+# Import utility functions
+from utils import (
+    validate_symbol, safe_yf_download, load_bundles, save_bundles,
+    parse_symbols_input, create_chart, add_fibonacci_to_chart,
+    add_trendline_to_chart, add_horizontal_line_to_chart,
+    add_vertical_line_to_chart, add_price_channel_to_chart, create_rrg_chart,
+    calculate_rs_ratio, calculate_rs_momentum, get_quadrant,
+    detect_candlestick_patterns, detect_swing_points,
+    calculate_fibonacci_levels, find_recent_swing_range, snap_to_ohlc,
+    calculate_volatility, calculate_sharpe_ratio, calculate_max_drawdown
+)
 
 # Page config
 st.set_page_config(
@@ -102,305 +110,8 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def _cached_yf_download(symbol: str, start: str = None, end: str = None, period: str = None):
-    """Internal cached function for Yahoo Finance data"""
-    ticker = yf.Ticker(symbol)
-    if period:
-        return ticker.history(period=period)
-    else:
-        return ticker.history(start=start, end=end)
-
-def safe_yf_download(symbol: str, start=None, end=None, period=None):
-    """Safely fetch data from Yahoo Finance with error handling and caching"""
-    # Validate symbol
-    if not validate_symbol(symbol):
-        return None, f"Invalid symbol format: {symbol}"
-
-    symbol = symbol.strip().upper()
-
-    # Convert dates to strings for caching
-    start_str = str(start) if start else None
-    end_str = str(end) if end else None
-
-    try:
-        df = _cached_yf_download(symbol, start_str, end_str, period)
-
-        if df is None or df.empty:
-            return None, f"No data returned for {symbol}"
-        return df, None
-    except ConnectionError as e:
-        logger.error(f"Network error fetching {symbol}: {e}")
-        return None, f"Network error. Please check your internet connection."
-    except ValueError as e:
-        logger.warning(f"Invalid data for {symbol}: {e}")
-        return None, f"Invalid data for {symbol}. Please check the symbol."
-    except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Error fetching {symbol}: {error_msg}")
-        if "NoneType" in error_msg:
-            return None, f"Yahoo Finance API error for {symbol}. The service may be temporarily unavailable."
-        return None, f"Failed to fetch {symbol}: {error_msg}"
-
-# Chart drawing tools configuration
-CHART_CONFIG = {
-    'modeBarButtonsToAdd': [
-        'drawline',
-        'drawopenpath',
-        'drawcircle',
-        'drawrect',
-        'eraseshape'
-    ],
-    'displayModeBar': True,
-    'displaylogo': False,
-    'toImageButtonOptions': {
-        'format': 'png',
-        'filename': 'pattern_pilot_chart',
-        'height': 800,
-        'width': 1200,
-        'scale': 2
-    }
-}
-
-# Drawing tool colors and styles
-DRAWING_COLORS = {
-    'Red': '#ef5350',
-    'Green': '#26a69a',
-    'Blue': '#42a5f5',
-    'Yellow': '#ffee58',
-    'Orange': '#ffa726',
-    'Purple': '#ab47bc',
-    'Cyan': '#00bcd4',
-    'Pink': '#ec407a',
-    'White': '#ffffff',
-    'Gold': '#ffd700'
-}
-
-LINE_STYLES = {
-    'Solid': 'solid',
-    'Dash': 'dash',
-    'Dot': 'dot',
-    'Dash-Dot': 'dashdot',
-    'Long Dash': 'longdash'
-}
-
-# Fibonacci ratios
-FIBONACCI_RATIOS = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.272, 1.618]
-FIBONACCI_COLORS = ['#ef5350', '#ffa726', '#ffee58', '#66bb6a', '#26a69a', '#42a5f5', '#ab47bc', '#ec407a', '#ffffff']
-
-
-def snap_to_ohlc(df, x_val, y_val, snap_enabled=True):
-    """Snap a point to the nearest OHLC value"""
-    if not snap_enabled or df is None or df.empty:
-        return y_val
-
-    try:
-        # Find the closest date
-        if isinstance(x_val, str):
-            x_val = pd.to_datetime(x_val)
-
-        # Get the index as datetime for comparison
-        idx = pd.to_datetime(df.index)
-        distances = abs(idx - x_val)
-        closest_idx = distances.argmin()
-        row = df.iloc[closest_idx]
-
-        # Find closest OHLC value
-        ohlc_values = [row['Open'], row['High'], row['Low'], row['Close']]
-        closest_val = min(ohlc_values, key=lambda x: abs(x - y_val))
-        return closest_val
-    except (IndexError, KeyError, TypeError, ValueError):
-        return y_val
-
-
-def calculate_fibonacci_levels(high_price, low_price, direction='retracement'):
-    """Calculate Fibonacci retracement or extension levels"""
-    diff = high_price - low_price
-    levels = {}
-
-    for ratio in FIBONACCI_RATIOS:
-        if direction == 'retracement':
-            # Retracement: from high going down
-            level = high_price - (diff * ratio)
-        else:
-            # Extension: from low going up beyond high
-            level = low_price + (diff * ratio)
-        levels[ratio] = level
-
-    return levels
-
-
-def add_fibonacci_to_chart(fig, start_date, end_date, high_price, low_price, color, line_style, show_labels=True):
-    """Add Fibonacci retracement lines to a chart"""
-    levels = calculate_fibonacci_levels(high_price, low_price)
-
-    for i, (ratio, price) in enumerate(levels.items()):
-        fib_color = FIBONACCI_COLORS[i] if i < len(FIBONACCI_COLORS) else color
-
-        fig.add_shape(
-            type="line",
-            x0=start_date, x1=end_date,
-            y0=price, y1=price,
-            line=dict(color=fib_color, width=1, dash=line_style),
-            row=1, col=1
-        )
-
-        if show_labels:
-            fig.add_annotation(
-                x=end_date, y=price,
-                text=f"{ratio:.1%} (${price:.2f})",
-                showarrow=False,
-                xanchor="left",
-                font=dict(size=10, color=fib_color),
-                row=1, col=1
-            )
-
-    # Add the high-low range box
-    fig.add_shape(
-        type="rect",
-        x0=start_date, x1=end_date,
-        y0=low_price, y1=high_price,
-        fillcolor="rgba(128, 128, 128, 0.1)",
-        line=dict(color=color, width=1, dash=line_style),
-        row=1, col=1
-    )
-
-    return fig
-
-
-def add_trendline_to_chart(fig, x0, y0, x1, y1, color, line_style, extend=False):
-    """Add a trendline to the chart"""
-    fig.add_shape(
-        type="line",
-        x0=x0, y0=y0, x1=x1, y1=y1,
-        line=dict(color=color, width=2, dash=line_style),
-        row=1, col=1
-    )
-    return fig
-
-
-def add_horizontal_line_to_chart(fig, y_val, x_start, x_end, color, line_style, label=None):
-    """Add a horizontal line (support/resistance) to the chart"""
-    fig.add_shape(
-        type="line",
-        x0=x_start, y0=y_val, x1=x_end, y1=y_val,
-        line=dict(color=color, width=2, dash=line_style),
-        row=1, col=1
-    )
-
-    if label:
-        fig.add_annotation(
-            x=x_end, y=y_val,
-            text=label,
-            showarrow=False,
-            xanchor="left",
-            font=dict(size=10, color=color),
-            row=1, col=1
-        )
-
-    return fig
-
-
-def add_vertical_line_to_chart(fig, x_val, y_min, y_max, color, line_style, label=None):
-    """Add a vertical line to the chart"""
-    fig.add_shape(
-        type="line",
-        x0=x_val, y0=y_min, x1=x_val, y1=y_max,
-        line=dict(color=color, width=2, dash=line_style),
-        row=1, col=1
-    )
-
-    if label:
-        fig.add_annotation(
-            x=x_val, y=y_max,
-            text=label,
-            showarrow=False,
-            yanchor="bottom",
-            font=dict(size=10, color=color),
-            row=1, col=1
-        )
-
-    return fig
-
-
-def add_price_channel_to_chart(fig, df, start_idx, end_idx, color, line_style):
-    """Add a price channel (parallel lines along highs and lows)"""
-    subset = df.iloc[start_idx:end_idx+1]
-
-    # Upper channel line (connect highs)
-    fig.add_trace(go.Scatter(
-        x=subset.index,
-        y=subset['High'],
-        mode='lines',
-        line=dict(color=color, width=1, dash=line_style),
-        showlegend=False,
-        name='Upper Channel'
-    ), row=1, col=1)
-
-    # Lower channel line (connect lows)
-    fig.add_trace(go.Scatter(
-        x=subset.index,
-        y=subset['Low'],
-        mode='lines',
-        line=dict(color=color, width=1, dash=line_style),
-        fill='tonexty',
-        fillcolor=f"rgba({int(color[1:3], 16)}, {int(color[3:5], 16)}, {int(color[5:7], 16)}, 0.1)",
-        showlegend=False,
-        name='Lower Channel'
-    ), row=1, col=1)
-
-    return fig
-
-
-def detect_swing_points(df, window=5):
-    """Detect swing highs and lows for Fibonacci placement"""
-    swing_highs = []
-    swing_lows = []
-
-    highs = df['High'].values
-    lows = df['Low'].values
-    dates = df.index
-
-    for i in range(window, len(df) - window):
-        # Check for swing high
-        is_swing_high = True
-        for j in range(1, window + 1):
-            if highs[i] <= highs[i - j] or highs[i] <= highs[i + j]:
-                is_swing_high = False
-                break
-        if is_swing_high:
-            swing_highs.append({'date': dates[i], 'price': highs[i], 'index': i})
-
-        # Check for swing low
-        is_swing_low = True
-        for j in range(1, window + 1):
-            if lows[i] >= lows[i - j] or lows[i] >= lows[i + j]:
-                is_swing_low = False
-                break
-        if is_swing_low:
-            swing_lows.append({'date': dates[i], 'price': lows[i], 'index': i})
-
-    return swing_highs, swing_lows
-
-
-def find_recent_swing_range(df, lookback_days=60):
-    """Find the most recent significant swing high and low for Fibonacci"""
-    recent_df = df.tail(lookback_days)
-    swing_highs, swing_lows = detect_swing_points(recent_df, window=3)
-
-    if swing_highs and swing_lows:
-        # Get the highest swing high and lowest swing low
-        highest = max(swing_highs, key=lambda x: x['price'])
-        lowest = min(swing_lows, key=lambda x: x['price'])
-        return highest, lowest
-
-    # Fallback to simple high/low
-    high_idx = recent_df['High'].idxmax()
-    low_idx = recent_df['Low'].idxmin()
-    return (
-        {'date': high_idx, 'price': recent_df.loc[high_idx, 'High']},
-        {'date': low_idx, 'price': recent_df.loc[low_idx, 'Low']}
-    )
+# Note: _cached_yf_download, safe_yf_download, and all utility functions
+# are now imported from utils module. Constants from config module.
 
 
 # Initialize session state for drawings
@@ -439,172 +150,11 @@ with st.sidebar:
 
 
 # ============================================================================
-# COMMON FUNCTIONS
+# Note: Common functions (detect_candlestick_patterns, create_chart,
+# calculate_rs_ratio, calculate_rs_momentum, get_quadrant, create_rrg_chart,
+# etc.) and constants (SECTOR_ETFS, SECTOR_COLORS) are now imported from
+# utils and config modules.
 # ============================================================================
-
-def detect_candlestick_patterns(df):
-    """Detect common candlestick patterns"""
-    patterns = []
-    df = df.copy()
-    df['body'] = abs(df['Close'] - df['Open'])
-    df['upper_shadow'] = df['High'] - df[['Open', 'Close']].max(axis=1)
-    df['lower_shadow'] = df[['Open', 'Close']].min(axis=1) - df['Low']
-    df['is_bullish'] = df['Close'] > df['Open']
-    df['range'] = df['High'] - df['Low']
-
-    for i in range(2, len(df)):
-        date = df.index[i]
-        row = df.iloc[i]
-        prev = df.iloc[i-1]
-        prev2 = df.iloc[i-2]
-
-        if row['range'] > 0 and row['body'] / row['range'] < 0.1:
-            patterns.append({'date': date, 'pattern': 'Doji', 'price': row['High'], 'type': 'neutral'})
-        elif row['lower_shadow'] > 2 * row['body'] and row['upper_shadow'] < row['body'] and row['body'] > 0:
-            patterns.append({'date': date, 'pattern': 'Hammer', 'price': row['Low'], 'type': 'bullish'})
-        elif row['upper_shadow'] > 2 * row['body'] and row['lower_shadow'] < row['body'] and row['body'] > 0:
-            patterns.append({'date': date, 'pattern': 'Shooting Star', 'price': row['High'], 'type': 'bearish'})
-        elif not prev['is_bullish'] and row['is_bullish'] and row['Open'] < prev['Close'] and row['Close'] > prev['Open'] and row['body'] > prev['body']:
-            patterns.append({'date': date, 'pattern': 'Bullish Engulfing', 'price': row['Low'], 'type': 'bullish'})
-        elif prev['is_bullish'] and not row['is_bullish'] and row['Open'] > prev['Close'] and row['Close'] < prev['Open'] and row['body'] > prev['body']:
-            patterns.append({'date': date, 'pattern': 'Bearish Engulfing', 'price': row['High'], 'type': 'bearish'})
-
-    return patterns
-
-
-def create_chart(df, symbol, show_sma=True, show_rsi=True, show_macd=True, show_volume=True, patterns=None):
-    """Create interactive candlestick chart"""
-    rows = 1
-    row_heights = [0.6]
-    if show_volume: rows += 1; row_heights.append(0.15)
-    if show_rsi: rows += 1; row_heights.append(0.15)
-    if show_macd: rows += 1; row_heights.append(0.15)
-
-    total = sum(row_heights)
-    row_heights = [h/total for h in row_heights]
-
-    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=row_heights)
-
-    fig.add_trace(go.Candlestick(
-        x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
-        name='Price', increasing_line_color='#26a69a', decreasing_line_color='#ef5350'
-    ), row=1, col=1)
-
-    if show_sma:
-        df['SMA20'] = ta.sma(df['Close'], length=20)
-        df['SMA50'] = ta.sma(df['Close'], length=50)
-        fig.add_trace(go.Scatter(x=df.index, y=df['SMA20'], name='SMA 20', line=dict(color='orange', width=1)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['SMA50'], name='SMA 50', line=dict(color='blue', width=1)), row=1, col=1)
-
-    if patterns:
-        for p in patterns:
-            color = '#26a69a' if p['type'] == 'bullish' else '#ef5350' if p['type'] == 'bearish' else '#ffeb3b'
-            symbol_marker = 'triangle-up' if p['type'] == 'bullish' else 'triangle-down' if p['type'] == 'bearish' else 'diamond'
-            fig.add_trace(go.Scatter(
-                x=[p['date']], y=[p['price']], mode='markers+text',
-                marker=dict(size=12, color=color, symbol=symbol_marker),
-                text=[p['pattern']], textposition='top center' if p['type'] != 'bullish' else 'bottom center',
-                textfont=dict(size=9), showlegend=False
-            ), row=1, col=1)
-
-    current_row = 2
-    if show_volume:
-        colors = ['#26a69a' if c >= o else '#ef5350' for c, o in zip(df['Close'], df['Open'])]
-        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=colors, showlegend=False), row=current_row, col=1)
-        fig.update_yaxes(title_text="Volume", row=current_row, col=1)
-        current_row += 1
-
-    if show_rsi:
-        df['RSI'] = ta.rsi(df['Close'], length=14)
-        fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], name='RSI', line=dict(color='purple', width=1)), row=current_row, col=1)
-        fig.add_hline(y=70, line_dash="dash", line_color="red", row=current_row, col=1)
-        fig.add_hline(y=30, line_dash="dash", line_color="green", row=current_row, col=1)
-        fig.update_yaxes(title_text="RSI", row=current_row, col=1)
-        current_row += 1
-
-    if show_macd:
-        macd = ta.macd(df['Close'])
-        if macd is not None:
-            fig.add_trace(go.Scatter(x=df.index, y=macd['MACD_12_26_9'], name='MACD', line=dict(color='blue', width=1)), row=current_row, col=1)
-            fig.add_trace(go.Scatter(x=df.index, y=macd['MACDs_12_26_9'], name='Signal', line=dict(color='orange', width=1)), row=current_row, col=1)
-            colors = ['#26a69a' if val >= 0 else '#ef5350' for val in macd['MACDh_12_26_9']]
-            fig.add_trace(go.Bar(x=df.index, y=macd['MACDh_12_26_9'], marker_color=colors, showlegend=False), row=current_row, col=1)
-            fig.update_yaxes(title_text="MACD", row=current_row, col=1)
-
-    fig.update_layout(title=f'{symbol} - Price Chart', template='plotly_dark', height=800, xaxis_rangeslider_visible=False,
-                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-    return fig
-
-
-# ============================================================================
-# RRG FUNCTIONS
-# ============================================================================
-
-SECTOR_ETFS = {
-    'XLK': 'Technology', 'XLF': 'Financials', 'XLV': 'Health Care',
-    'XLY': 'Consumer Discret.', 'XLP': 'Consumer Staples', 'XLE': 'Energy',
-    'XLI': 'Industrials', 'XLB': 'Materials', 'XLU': 'Utilities',
-    'XLRE': 'Real Estate', 'XLC': 'Communication'
-}
-
-SECTOR_COLORS = {
-    'XLK': '#00d4ff', 'XLF': '#00ff88', 'XLV': '#ff6b6b', 'XLY': '#ffd93d',
-    'XLP': '#6bcb77', 'XLE': '#ff8c00', 'XLI': '#9d4edd', 'XLB': '#4ecdc4',
-    'XLU': '#f8961e', 'XLRE': '#577590', 'XLC': '#f72585'
-}
-
-
-def calculate_rs_ratio(stock_prices, benchmark_prices, window=10):
-    rs = stock_prices / benchmark_prices * 100
-    rs_sma = rs.rolling(window=window).mean()
-    return 100 + ((rs / rs_sma - 1) * 100)
-
-
-def calculate_rs_momentum(rs_ratio, window=10):
-    rs_ratio_sma = rs_ratio.rolling(window=window).mean()
-    return 100 + ((rs_ratio / rs_ratio_sma - 1) * 100)
-
-
-def get_quadrant(rs_ratio, rs_momentum):
-    if rs_ratio >= 100 and rs_momentum >= 100: return "Leading"
-    elif rs_ratio >= 100: return "Weakening"
-    elif rs_momentum < 100: return "Lagging"
-    else: return "Improving"
-
-
-def create_rrg_chart(rrg_data, tail_length=5):
-    fig = go.Figure()
-    fig.add_shape(type="rect", x0=100, y0=100, x1=110, y1=110, fillcolor="rgba(0, 255, 0, 0.1)", line=dict(width=0))
-    fig.add_shape(type="rect", x0=100, y0=90, x1=110, y1=100, fillcolor="rgba(255, 255, 0, 0.1)", line=dict(width=0))
-    fig.add_shape(type="rect", x0=90, y0=90, x1=100, y1=100, fillcolor="rgba(255, 0, 0, 0.1)", line=dict(width=0))
-    fig.add_shape(type="rect", x0=90, y0=100, x1=100, y1=110, fillcolor="rgba(0, 0, 255, 0.1)", line=dict(width=0))
-
-    fig.add_annotation(x=105, y=108, text="LEADING", showarrow=False, font=dict(size=14, color="green"))
-    fig.add_annotation(x=105, y=92, text="WEAKENING", showarrow=False, font=dict(size=14, color="orange"))
-    fig.add_annotation(x=95, y=92, text="LAGGING", showarrow=False, font=dict(size=14, color="red"))
-    fig.add_annotation(x=95, y=108, text="IMPROVING", showarrow=False, font=dict(size=14, color="blue"))
-
-    fig.add_hline(y=100, line_dash="dash", line_color="gray", line_width=1)
-    fig.add_vline(x=100, line_dash="dash", line_color="gray", line_width=1)
-
-    for symbol, data in rrg_data.items():
-        if len(data) < 2: continue
-        color = SECTOR_COLORS.get(symbol, '#ffffff')
-        name = SECTOR_ETFS.get(symbol, symbol)
-        tail_data = data.tail(tail_length)
-
-        fig.add_trace(go.Scatter(x=tail_data['RS_Ratio'], y=tail_data['RS_Momentum'],
-            mode='lines', line=dict(color=color, width=2), name=name, showlegend=False, opacity=0.6))
-
-        current = data.iloc[-1]
-        fig.add_trace(go.Scatter(x=[current['RS_Ratio']], y=[current['RS_Momentum']],
-            mode='markers+text', marker=dict(size=15, color=color), text=[symbol],
-            textposition='top center', textfont=dict(size=10, color=color), name=f"{name} ({symbol})"))
-
-    fig.update_layout(title="Relative Rotation Graph", template='plotly_dark', height=700,
-                      xaxis=dict(range=[90, 110], dtick=2, title="RS-Ratio"),
-                      yaxis=dict(range=[90, 110], dtick=2, title="RS-Momentum"))
-    return fig
 
 
 # ============================================================================
@@ -990,8 +540,8 @@ if selected_page == "🔄 RRG Sectors":
                                 rrg_df = pd.DataFrame({'RS_Ratio': rs_ratio, 'RS_Momentum': rs_momentum}).dropna()
                                 if len(rrg_df) > 0:
                                     rrg_data[sym] = rrg_df
-                    except Exception:
-                        pass  # Skip symbols that fail to fetch
+                    except Exception as e:
+                        st.warning(f"Skipped {sym}: {e}")
 
                 if rrg_data:
                     fig = create_rrg_chart(rrg_data, tail_length)
@@ -1170,8 +720,8 @@ if selected_page == "📁 Data Manager":
                         try:
                             df = pd.read_parquet(os.path.join(DATA_DIR, f))
                             st.write(f"{len(df)} rows")
-                        except Exception:
-                            st.write("Error reading file")
+                        except Exception as e:
+                            st.write(f"Error: {e}")
                     with col3:
                         if st.button("Delete", key=f"del_{f}"):
                             os.remove(os.path.join(DATA_DIR, f))
@@ -1784,8 +1334,8 @@ if selected_page == "📦 Group Analysis":
                             data = yf.Ticker(sym).history(start=start, end=datetime.now())
                             if not data.empty:
                                 prices[sym] = data['Close']
-                        except Exception:
-                            pass  # Skip on error
+                        except Exception as e:
+                            st.warning(f"Skipped {sym}: {e}")
 
                     if len(prices.columns) < 2:
                         st.error("Need at least 2 symbols with data")
@@ -1873,8 +1423,8 @@ if selected_page == "📦 Group Analysis":
                             data = yf.Ticker(sym).history(start=start, end=datetime.now())
                             if not data.empty:
                                 prices[sym] = data['Close']
-                        except Exception:
-                            pass  # Skip on error
+                        except Exception as e:
+                            st.warning(f"Skipped {sym}: {e}")
 
                     if benchmark not in prices.columns:
                         st.error(f"Could not fetch benchmark {benchmark}")
@@ -1999,8 +1549,8 @@ if selected_page == "📦 Group Analysis":
                             data = yf.Ticker(sym).history(start=start, end=datetime.now())
                             if not data.empty:
                                 prices[sym] = data['Close']
-                        except Exception:
-                            pass  # Skip on error
+                        except Exception as e:
+                            st.warning(f"Skipped {sym}: {e}")
 
                     if len(prices.columns) < 2:
                         st.error("Need at least 2 symbols")
@@ -2056,8 +1606,8 @@ if selected_page == "📦 Group Analysis":
                                 bench_norm = bench_data['Close'] / bench_data['Close'].iloc[0] * 100
                                 fig.add_trace(go.Scatter(x=bench_norm.index, y=bench_norm,
                                     name=compare_to, line=dict(color='gray', width=1)), row=1, col=1)
-                            except Exception:
-                                pass  # Skip on error
+                            except Exception as e:
+                                pass  # Benchmark overlay failed: {e}
 
                         if indicator_type == "Equal-Weight Performance":
                             fig.add_trace(go.Scatter(x=indicator.index, y=indicator,
@@ -2129,8 +1679,8 @@ if selected_page == "📦 Group Analysis":
                                 data = yf.Ticker(sym).history(start=start, end=datetime.now())
                                 if not data.empty:
                                     prices[sym] = data['Close']
-                            except Exception:
-                                pass  # Skip on error
+                            except Exception as e:
+                                st.warning(f"Skipped {sym}: {e}")
 
                         if len(prices.columns) < 3:
                             st.error("Need at least 3 symbols")
@@ -2195,8 +1745,8 @@ if selected_page == "📦 Group Analysis":
                                 spy = yf.Ticker('SPY').history(start=start, end=datetime.now())
                                 fig.add_trace(go.Scatter(x=spy.index, y=spy['Close'],
                                     name='SPY', line=dict(color='white', width=1)), row=1, col=1)
-                            except Exception:
-                                pass  # Skip on error
+                            except Exception as e:
+                                pass  # SPY overlay failed: {e}
 
                             # Color by regime
                             colors = ['green', 'yellow', 'red', 'orange', 'purple', 'blue']
@@ -3336,8 +2886,8 @@ if selected_page == "🌡️ Sentiment":
                                     'Above SMA20': '✅' if current > sma20 else '❌',
                                     'Above SMA50': '✅' if current > sma50 else '❌'
                                 })
-                        except Exception:
-                            pass  # Skip on error
+                        except Exception as e:
+                            st.warning(f"Skipped {sym}: {e}")
 
                     if breadth_data:
                         df_breadth = pd.DataFrame(breadth_data)
@@ -3453,8 +3003,8 @@ if selected_page == "📈 Economic Data":
                                     '52W Low': low_52w,
                                     '% from High': (current/high_52w - 1) * 100
                                 })
-                        except Exception:
-                            pass  # Skip on error
+                        except Exception as e:
+                            st.warning(f"Skipped {sym}: {e}")
 
                     if results:
                         df_ind = pd.DataFrame(results)
@@ -3485,8 +3035,8 @@ if selected_page == "📈 Economic Data":
                                 data = yf.Ticker(sym).history(start=start, end=datetime.now())
                                 normalized = data['Close'] / data['Close'].iloc[0] * 100
                                 fig.add_trace(go.Scatter(x=data.index, y=normalized, name=name))
-                            except Exception:
-                                pass  # Skip on error
+                            except Exception as e:
+                                st.warning(f"Skipped {sym}: {e}")
 
                         fig.update_layout(title='Index Performance (Normalized to 100)',
                                         template='plotly_dark', height=400,
@@ -3528,8 +3078,8 @@ if selected_page == "📈 Economic Data":
                                     'Price': current,
                                     'YTD Return': ytd_ret
                                 })
-                        except Exception:
-                            pass  # Skip on error
+                        except Exception as e:
+                            st.warning(f"Skipped {sym}: {e}")
 
                     if treasury_data:
                         df_treas = pd.DataFrame(treasury_data)
@@ -3542,8 +3092,8 @@ if selected_page == "📈 Economic Data":
                                 data = yf.Ticker(sym).history(start=start, end=datetime.now())
                                 normalized = data['Close'] / data['Close'].iloc[0] * 100
                                 fig.add_trace(go.Scatter(x=data.index, y=normalized, name=name))
-                            except Exception:
-                                pass  # Skip on error
+                            except Exception as e:
+                                st.warning(f"Skipped {sym}: {e}")
 
                         fig.update_layout(title='Treasury ETF Performance (Normalized)',
                                         template='plotly_dark', height=400)
@@ -3602,8 +3152,8 @@ if selected_page == "📈 Economic Data":
                                     '3M Return': ret_3m,
                                     'Above 50 SMA': '✅' if current > sma50 else '❌'
                                 })
-                        except Exception:
-                            pass  # Skip on error
+                        except Exception as e:
+                            st.warning(f"Skipped {sym}: {e}")
 
                     if proxy_data:
                         df_proxy = pd.DataFrame(proxy_data)

@@ -133,7 +133,7 @@ class TestCandlestickPatterns:
         candles = [
             [100, 105, 95, 98],   # Previous
             [99, 104, 94, 97],    # Previous
-            [99, 100, 90, 99.5],  # Hammer - long lower shadow
+            [95, 96, 90, 96],  # Hammer - body=1, range=6, lower_shadow=5, upper_shadow=0
         ]
         df = self.create_candle_df(candles)
         patterns = detect_candlestick_patterns(df)
@@ -210,7 +210,7 @@ class TestPerformanceMetrics:
     def test_sharpe_ratio(self):
         """Test Sharpe ratio calculation"""
         # Consistent positive returns
-        returns = pd.Series([0.01] * 100)  # 1% daily returnsucket
+        returns = pd.Series([0.01] * 100)  # 1% daily returns
         sharpe = calculate_sharpe_ratio(returns)
 
         # Should be positive for positive returns

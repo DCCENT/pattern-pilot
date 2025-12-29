@@ -40,7 +40,7 @@ class TestValidateSymbol:
         """Test that invalid symbols return False"""
         assert validate_symbol('') is False
         assert validate_symbol(None) is False
-        assert validate_symbol('TOOLONG') is False  # More than 5 chars
+        assert validate_symbol('TOOLONG') is False  # 7 chars exceeds max length
         assert validate_symbol('123') is False  # Numbers only
         assert validate_symbol('AAP!L') is False  # Special characters
         assert validate_symbol('a a p l') is False  # Spaces
