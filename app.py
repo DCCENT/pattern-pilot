@@ -1,6 +1,13 @@
 """
 Pattern Pilot - Financial Time Series Pattern Recognition
 A comprehensive tool for pattern detection, backtesting, and AI-powered signal discovery
+
+Utility modules available for reuse:
+    - config.py: Constants and configuration settings
+    - utils/data.py: Data fetching and validation functions
+    - utils/charts.py: Chart creation utilities
+    - utils/indicators.py: Technical indicator calculations
+    - tests/: Unit tests for utilities
 """
 
 import streamlit as st
