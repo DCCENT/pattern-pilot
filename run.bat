@@ -31,23 +31,27 @@ if %errorlevel% neq 0 (
     )
 )
 
-:: Check if port 8501 is already in use
-netstat -ano | findstr ":8501" >nul 2>&1
+:: Find an available port starting from 8501
+set PORT=8501
+:find_port
+netstat -ano | findstr ":%PORT% " | findstr "LISTENING" >nul 2>&1
 if %errorlevel% equ 0 (
-    echo.
-    echo WARNING: Port 8501 is already in use.
-    echo Another instance may be running. Close it first.
-    echo.
-    pause
-    exit /b 1
+    echo Port %PORT% is in use, trying next...
+    set /a PORT+=1
+    if %PORT% gtr 8510 (
+        echo ERROR: No available ports found between 8501-8510
+        pause
+        exit /b 1
+    )
+    goto find_port
 )
 
 echo.
 echo Starting Pattern Pilot...
 echo.
-echo App URL: http://localhost:8501
+echo App URL: http://localhost:%PORT%
 echo Press Ctrl+C to stop.
 echo.
 
-start /b cmd /c "timeout /t 2 /nobreak >nul && start http://localhost:8501"
-streamlit run app.py
+start /b cmd /c "timeout /t 2 /nobreak >nul && start http://localhost:%PORT%"
+streamlit run app.py --server.port %PORT%
