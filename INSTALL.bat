@@ -4,7 +4,37 @@ setlocal enabledelayedexpansion
 :: Pattern Pilot - One-Click Installer
 :: ====================================
 
+:: IMPORTANT: Keep window open no matter what happens
+:: This prevents the window from closing before user sees errors
+if "%~1"=="" (
+    cmd /k "%~f0" run
+    exit /b
+)
+
 title Pattern Pilot Installer
+
+:: Check if we're in the right directory (requirements.txt should exist)
+:: This catches the common error of running from inside a ZIP file
+if not exist "%~dp0requirements.txt" (
+    echo.
+    echo ========================================
+    echo    ERROR: Required files not found!
+    echo ========================================
+    echo.
+    echo This usually means:
+    echo.
+    echo   1. You're running this from INSIDE a ZIP file
+    echo      FIX: Extract/unzip the folder first, then run INSTALL.bat
+    echo.
+    echo   2. Some files are missing from the download
+    echo      FIX: Re-download from https://github.com/DCCENT/pattern-pilot
+    echo.
+    echo Current location: %~dp0
+    echo.
+    echo Press any key to exit...
+    pause >nul
+    exit /b 1
+)
 
 :: Colors for output
 set "GREEN=[92m"

@@ -2,9 +2,26 @@
 :: Pattern Pilot - Quick Launcher
 :: (Use INSTALL.bat for first-time setup)
 
+:: Keep window open on any error
+if "%~1"=="" (
+    cmd /k "%~f0" run
+    exit /b
+)
+
 title Pattern Pilot
 
 cd /d "%~dp0"
+
+:: Check if running from inside ZIP
+if not exist "%~dp0app.py" (
+    echo.
+    echo ERROR: Cannot find app.py
+    echo.
+    echo If running from a ZIP file, extract it first!
+    echo.
+    pause
+    exit /b 1
+)
 
 :: Check if already installed
 if not exist "venv\Scripts\streamlit.exe" (
