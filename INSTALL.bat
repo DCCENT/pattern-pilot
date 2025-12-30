@@ -46,7 +46,7 @@ echo.
 cd /d "%~dp0"
 
 :: Step 1: Check if venv already exists with working Python
-echo [1/4] Checking Python environment...
+echo Step 1 of 5: Checking Python environment...
 
 if exist "venv\Scripts\python.exe" (
     echo    Found existing virtual environment
@@ -141,7 +141,7 @@ if !PY_MAJOR! equ 3 if !PY_MINOR! lss 10 (
 
 :: Step 2: Create virtual environment
 echo.
-echo [2/4] Setting up virtual environment...
+echo Step 2 of 5: Setting up virtual environment...
 if not exist "venv" (
     echo    Creating new virtual environment...
     %PYTHON_CMD% -m venv venv
@@ -158,7 +158,7 @@ if not exist "venv" (
 :venv_ready
 :: Step 3: Install/verify dependencies
 echo.
-echo [3/4] Checking dependencies...
+echo Step 3 of 5: Checking dependencies...
 call venv\Scripts\activate.bat
 
 :: Check if streamlit is already installed
@@ -186,7 +186,7 @@ if %errorlevel% equ 0 (
 
 :: Step 4: Create desktop shortcut
 echo.
-echo [4/5] Creating desktop shortcut...
+echo Step 4 of 5: Creating desktop shortcut...
 
 set "SHORTCUT=%USERPROFILE%\Desktop\Pattern Pilot.lnk"
 set "TARGET=%~dp0run.bat"
@@ -203,7 +203,7 @@ if exist "%SHORTCUT%" (
 
 :: Step 5: Check port and launch the app
 echo.
-echo [5/5] Starting Pattern Pilot...
+echo Step 5 of 5: Starting Pattern Pilot...
 
 :: Find an available port
 set PORT=8501
