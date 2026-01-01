@@ -24,6 +24,7 @@ from io import StringIO
 import joblib
 import warnings
 import logging
+from itertools import product
 
 warnings.filterwarnings('ignore')
 
@@ -733,6 +734,146 @@ if selected_page == "📁 Data Manager":
 
 
 # ============================================================================
+# BACKTESTER HELPER FUNCTIONS
+# ============================================================================
+
+def run_backtest_with_params(df, strategy_type, params, initial_capital=100000, commission=0.0):
+    """
+    Run a backtest with given parameters and return performance metrics.
+
+    Args:
+        df: DataFrame with OHLCV data
+        strategy_type: "SMA Crossover", "RSI Mean Reversion", or "MACD Signal"
+        params: dict of strategy parameters
+        initial_capital: starting capital
+        commission: commission per trade
+
+    Returns:
+        dict with total_return, sharpe, max_drawdown, win_rate, num_trades
+    """
+    df = df.copy()
+
+    # Generate signals based on strategy type
+    if strategy_type == "SMA Crossover":
+        fast_sma = params.get('fast_sma', 20)
+        slow_sma = params.get('slow_sma', 50)
+        df['fast'] = ta.sma(df['Close'], length=fast_sma)
+        df['slow'] = ta.sma(df['Close'], length=slow_sma)
+        df['signal'] = 0
+        df.loc[df['fast'] > df['slow'], 'signal'] = 1
+        df.loc[df['fast'] < df['slow'], 'signal'] = -1
+
+    elif strategy_type == "RSI Mean Reversion":
+        rsi_period = params.get('rsi_period', 14)
+        rsi_oversold = params.get('rsi_oversold', 30)
+        rsi_overbought = params.get('rsi_overbought', 70)
+        df['rsi'] = ta.rsi(df['Close'], length=rsi_period)
+        df['signal'] = 0
+        df.loc[df['rsi'] < rsi_oversold, 'signal'] = 1
+        df.loc[df['rsi'] > rsi_overbought, 'signal'] = -1
+
+    elif strategy_type == "MACD Signal":
+        macd_fast = params.get('macd_fast', 12)
+        macd_slow = params.get('macd_slow', 26)
+        macd_sig = params.get('macd_signal', 9)
+        macd_result = ta.macd(df['Close'], fast=macd_fast, slow=macd_slow, signal=macd_sig)
+        df['macd'] = macd_result[f'MACD_{macd_fast}_{macd_slow}_{macd_sig}']
+        df['macd_signal'] = macd_result[f'MACDs_{macd_fast}_{macd_slow}_{macd_sig}']
+        df['signal'] = 0
+        df.loc[df['macd'] > df['macd_signal'], 'signal'] = 1
+        df.loc[df['macd'] < df['macd_signal'], 'signal'] = -1
+
+    # Run backtest calculations
+    df = df.dropna()
+    if len(df) < 10:
+        return None  # Not enough data
+
+    df['position'] = df['signal'].shift(1).fillna(0)
+    df['returns'] = df['Close'].pct_change()
+    df['strategy_returns'] = df['position'] * df['returns']
+
+    # Commission
+    df['trade'] = df['position'].diff().abs()
+    df['commission_cost'] = df['trade'] * commission / initial_capital
+    df['strategy_returns'] = df['strategy_returns'] - df['commission_cost']
+
+    # Equity curve
+    df['equity'] = initial_capital * (1 + df['strategy_returns']).cumprod()
+
+    # Calculate metrics
+    total_return = (df['equity'].iloc[-1] / initial_capital - 1) * 100
+    sharpe = df['strategy_returns'].mean() / df['strategy_returns'].std() * np.sqrt(252) if df['strategy_returns'].std() > 0 else 0
+    max_dd = ((df['equity'] / df['equity'].cummax()) - 1).min() * 100
+
+    non_zero_returns = df[df['strategy_returns'] != 0]['strategy_returns']
+    win_rate = (non_zero_returns[non_zero_returns > 0].count() / non_zero_returns.count() * 100) if len(non_zero_returns) > 0 else 0
+    num_trades = int(df['trade'].sum() / 2)
+
+    return {
+        'total_return': total_return,
+        'sharpe': sharpe,
+        'max_drawdown': max_dd,
+        'win_rate': win_rate,
+        'num_trades': num_trades
+    }
+
+
+def optimize_parameters(df, strategy_type, param_ranges, initial_capital=100000, commission=0.0, target='total_return', progress_callback=None):
+    """
+    Grid search optimization for strategy parameters.
+
+    Args:
+        df: DataFrame with OHLCV data
+        strategy_type: Strategy to optimize
+        param_ranges: dict of {param_name: [values to test]}
+        initial_capital: starting capital
+        commission: commission per trade
+        target: 'total_return', 'sharpe', or 'max_drawdown'
+        progress_callback: function(current, total) for progress updates
+
+    Returns:
+        list of dicts with params and metrics, sorted by target
+    """
+    results = []
+
+    # Generate all combinations
+    param_names = list(param_ranges.keys())
+    param_values = [param_ranges[name] for name in param_names]
+    combinations = list(product(*param_values))
+
+    for i, combo in enumerate(combinations):
+        params = dict(zip(param_names, combo))
+
+        # Skip invalid combinations
+        if strategy_type == "SMA Crossover":
+            if params.get('fast_sma', 0) >= params.get('slow_sma', 1):
+                continue
+        elif strategy_type == "RSI Mean Reversion":
+            if params.get('rsi_oversold', 0) >= params.get('rsi_overbought', 100):
+                continue
+        elif strategy_type == "MACD Signal":
+            if params.get('macd_fast', 0) >= params.get('macd_slow', 1):
+                continue
+
+        metrics = run_backtest_with_params(df, strategy_type, params, initial_capital, commission)
+
+        if metrics:
+            results.append({**params, **metrics})
+
+        if progress_callback:
+            progress_callback(i + 1, len(combinations))
+
+    # Sort by target metric
+    if target == 'max_drawdown':
+        # For drawdown, higher (less negative) is better
+        results.sort(key=lambda x: x.get(target, -999), reverse=True)
+    else:
+        results.sort(key=lambda x: x.get(target, -999), reverse=True)
+
+    return results
+
+
+# ============================================================================
 # TAB 4: BACKTESTER
 # ============================================================================
 
@@ -812,125 +953,448 @@ return signal""", height=150, key="bt_code")
     with col3:
         commission = st.number_input("Commission ($)", value=0.0, min_value=0.0, key="bt_comm")
 
-    if st.button("Run Backtest", type="primary", key="bt_run"):
-        with st.spinner("Running backtest..."):
-            try:
-                # Get data
-                if data_source == "Fetch from Yahoo":
-                    df, error = safe_yf_download(bt_symbol, start=bt_start, end=bt_end)
-                    if error:
-                        st.error(error)
-                        st.stop()
-                else:
-                    df = pd.read_parquet(os.path.join(DATA_DIR, f"{bt_dataset}.parquet"))
+    # Parameter Optimization Section
+    st.markdown("---")
+    optimize_mode = st.checkbox("Enable Parameter Optimization", key="bt_optimize",
+                                help="Find optimal parameters that maximize returns")
 
-                if df is None or df.empty:
-                    st.error("No data available. Please check the symbol and date range, or try again later.")
-                else:
-                    # Generate signals
-                    if strategy_type == "SMA Crossover":
-                        df['fast'] = ta.sma(df['Close'], length=fast_sma)
-                        df['slow'] = ta.sma(df['Close'], length=slow_sma)
-                        df['signal'] = 0
-                        df.loc[df['fast'] > df['slow'], 'signal'] = 1
-                        df.loc[df['fast'] < df['slow'], 'signal'] = -1
+    if optimize_mode and strategy_type != "Custom Signal (Advanced)":
+        st.markdown("### Optimization Settings")
 
-                    elif strategy_type == "RSI Mean Reversion":
-                        df['rsi'] = ta.rsi(df['Close'], length=rsi_period)
-                        df['signal'] = 0
-                        df.loc[df['rsi'] < rsi_oversold, 'signal'] = 1
-                        df.loc[df['rsi'] > rsi_overbought, 'signal'] = -1
+        opt_target = st.selectbox("Optimize For", [
+            "Total Return",
+            "Sharpe Ratio",
+            "Min Drawdown"
+        ], key="opt_target", help="Metric to maximize (or minimize for drawdown)")
 
-                    elif strategy_type == "MACD Signal":
-                        macd = ta.macd(df['Close'], fast=macd_fast, slow=macd_slow, signal=macd_signal)
-                        df['macd'] = macd[f'MACD_{macd_fast}_{macd_slow}_{macd_signal}']
-                        df['macd_signal'] = macd[f'MACDs_{macd_fast}_{macd_slow}_{macd_signal}']
-                        df['signal'] = 0
-                        df.loc[df['macd'] > df['macd_signal'], 'signal'] = 1
-                        df.loc[df['macd'] < df['macd_signal'], 'signal'] = -1
+        st.markdown("**Parameter Ranges** (min, max, step)")
 
-                    else:  # Custom - using safe expression evaluation
-                        # Parse custom code for safe indicator-based signals
-                        # Only allows predefined indicator comparisons, not arbitrary code
-                        st.warning("Custom strategies use a restricted syntax for security. Use predefined strategies for best results.")
-                        try:
-                            # Default to RSI-based strategy for custom
-                            df['rsi'] = ta.rsi(df['Close'], length=14)
+        if strategy_type == "SMA Crossover":
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("*Fast SMA*")
+                c1, c2, c3 = st.columns(3)
+                fast_min = c1.number_input("Min", value=5, min_value=2, key="opt_fast_min")
+                fast_max = c2.number_input("Max", value=30, min_value=3, key="opt_fast_max")
+                fast_step = c3.number_input("Step", value=5, min_value=1, key="opt_fast_step")
+            with col2:
+                st.markdown("*Slow SMA*")
+                c1, c2, c3 = st.columns(3)
+                slow_min = c1.number_input("Min", value=20, min_value=5, key="opt_slow_min")
+                slow_max = c2.number_input("Max", value=100, min_value=10, key="opt_slow_max")
+                slow_step = c3.number_input("Step", value=10, min_value=1, key="opt_slow_step")
+
+            # Calculate combinations
+            fast_values = list(range(fast_min, fast_max + 1, fast_step))
+            slow_values = list(range(slow_min, slow_max + 1, slow_step))
+            num_combos = len(fast_values) * len(slow_values)
+            param_ranges = {'fast_sma': fast_values, 'slow_sma': slow_values}
+
+        elif strategy_type == "RSI Mean Reversion":
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.markdown("*RSI Period*")
+                c1, c2, c3 = st.columns(3)
+                rsi_p_min = c1.number_input("Min", value=7, min_value=2, key="opt_rsi_p_min")
+                rsi_p_max = c2.number_input("Max", value=21, min_value=3, key="opt_rsi_p_max")
+                rsi_p_step = c3.number_input("Step", value=7, min_value=1, key="opt_rsi_p_step")
+            with col2:
+                st.markdown("*Oversold*")
+                c1, c2, c3 = st.columns(3)
+                os_min = c1.number_input("Min", value=20, min_value=5, key="opt_os_min")
+                os_max = c2.number_input("Max", value=40, min_value=10, key="opt_os_max")
+                os_step = c3.number_input("Step", value=5, min_value=1, key="opt_os_step")
+            with col3:
+                st.markdown("*Overbought*")
+                c1, c2, c3 = st.columns(3)
+                ob_min = c1.number_input("Min", value=60, min_value=50, key="opt_ob_min")
+                ob_max = c2.number_input("Max", value=80, min_value=55, key="opt_ob_max")
+                ob_step = c3.number_input("Step", value=5, min_value=1, key="opt_ob_step")
+
+            period_values = list(range(rsi_p_min, rsi_p_max + 1, rsi_p_step))
+            os_values = list(range(os_min, os_max + 1, os_step))
+            ob_values = list(range(ob_min, ob_max + 1, ob_step))
+            num_combos = len(period_values) * len(os_values) * len(ob_values)
+            param_ranges = {'rsi_period': period_values, 'rsi_oversold': os_values, 'rsi_overbought': ob_values}
+
+        elif strategy_type == "MACD Signal":
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.markdown("*Fast Period*")
+                c1, c2, c3 = st.columns(3)
+                mf_min = c1.number_input("Min", value=8, min_value=2, key="opt_mf_min")
+                mf_max = c2.number_input("Max", value=16, min_value=3, key="opt_mf_max")
+                mf_step = c3.number_input("Step", value=2, min_value=1, key="opt_mf_step")
+            with col2:
+                st.markdown("*Slow Period*")
+                c1, c2, c3 = st.columns(3)
+                ms_min = c1.number_input("Min", value=20, min_value=5, key="opt_ms_min")
+                ms_max = c2.number_input("Max", value=32, min_value=10, key="opt_ms_max")
+                ms_step = c3.number_input("Step", value=3, min_value=1, key="opt_ms_step")
+            with col3:
+                st.markdown("*Signal Period*")
+                c1, c2, c3 = st.columns(3)
+                sig_min = c1.number_input("Min", value=5, min_value=2, key="opt_sig_min")
+                sig_max = c2.number_input("Max", value=12, min_value=3, key="opt_sig_max")
+                sig_step = c3.number_input("Step", value=2, min_value=1, key="opt_sig_step")
+
+            fast_values = list(range(mf_min, mf_max + 1, mf_step))
+            slow_values = list(range(ms_min, ms_max + 1, ms_step))
+            sig_values = list(range(sig_min, sig_max + 1, sig_step))
+            num_combos = len(fast_values) * len(slow_values) * len(sig_values)
+            param_ranges = {'macd_fast': fast_values, 'macd_slow': slow_values, 'macd_signal': sig_values}
+
+        # Show estimated combinations
+        if num_combos > 500:
+            st.warning(f"Testing {num_combos} combinations may take a while. Consider increasing step size.")
+        else:
+            st.info(f"Will test approximately {num_combos} parameter combinations")
+
+    elif optimize_mode and strategy_type == "Custom Signal (Advanced)":
+        st.warning("Parameter optimization is not available for custom strategies.")
+        optimize_mode = False
+
+    # Run buttons
+    if optimize_mode and strategy_type != "Custom Signal (Advanced)":
+        if st.button("Run Optimization", type="primary", key="bt_run_opt"):
+            with st.spinner("Optimizing parameters..."):
+                try:
+                    # Get data
+                    if data_source == "Fetch from Yahoo":
+                        df, error = safe_yf_download(bt_symbol, start=bt_start, end=bt_end)
+                        if error:
+                            st.error(error)
+                            st.stop()
+                    else:
+                        df = pd.read_parquet(os.path.join(DATA_DIR, f"{bt_dataset}.parquet"))
+
+                    if df is None or df.empty:
+                        st.error("No data available.")
+                    else:
+                        # Map target selection to metric name
+                        target_map = {
+                            "Total Return": "total_return",
+                            "Sharpe Ratio": "sharpe",
+                            "Min Drawdown": "max_drawdown"
+                        }
+                        target_metric = target_map[opt_target]
+
+                        # Run optimization with progress
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+
+                        def update_progress(current, total):
+                            progress_bar.progress(current / total)
+                            status_text.text(f"Testing combination {current}/{total}...")
+
+                        results = optimize_parameters(
+                            df, strategy_type, param_ranges,
+                            initial_capital, commission, target_metric,
+                            progress_callback=update_progress
+                        )
+
+                        progress_bar.progress(1.0)
+                        status_text.text("Optimization complete!")
+
+                        if results:
+                            st.markdown("### Optimization Results (Top 10)")
+
+                            # Format results for display
+                            results_df = pd.DataFrame(results[:10])
+
+                            # Rename columns for display
+                            col_rename = {
+                                'fast_sma': 'Fast SMA', 'slow_sma': 'Slow SMA',
+                                'rsi_period': 'RSI Period', 'rsi_oversold': 'Oversold', 'rsi_overbought': 'Overbought',
+                                'macd_fast': 'MACD Fast', 'macd_slow': 'MACD Slow', 'macd_signal': 'Signal',
+                                'total_return': 'Return %', 'sharpe': 'Sharpe', 'max_drawdown': 'Max DD %',
+                                'win_rate': 'Win Rate %', 'num_trades': 'Trades'
+                            }
+                            results_df = results_df.rename(columns=col_rename)
+
+                            # Format numeric columns
+                            for col in ['Return %', 'Sharpe', 'Max DD %', 'Win Rate %']:
+                                if col in results_df.columns:
+                                    results_df[col] = results_df[col].apply(lambda x: f"{x:.2f}")
+
+                            st.dataframe(results_df, use_container_width=True)
+
+                            # Best parameters
+                            best = results[0]
+                            st.success(f"**Best Parameters Found:**")
+
+                            if strategy_type == "SMA Crossover":
+                                st.write(f"Fast SMA: **{best['fast_sma']}**, Slow SMA: **{best['slow_sma']}**")
+                                st.session_state['best_fast_sma'] = best['fast_sma']
+                                st.session_state['best_slow_sma'] = best['slow_sma']
+                            elif strategy_type == "RSI Mean Reversion":
+                                st.write(f"Period: **{best['rsi_period']}**, Oversold: **{best['rsi_oversold']}**, Overbought: **{best['rsi_overbought']}**")
+                                st.session_state['best_rsi_period'] = best['rsi_period']
+                                st.session_state['best_rsi_oversold'] = best['rsi_oversold']
+                                st.session_state['best_rsi_overbought'] = best['rsi_overbought']
+                            elif strategy_type == "MACD Signal":
+                                st.write(f"Fast: **{best['macd_fast']}**, Slow: **{best['macd_slow']}**, Signal: **{best['macd_signal']}**")
+                                st.session_state['best_macd_fast'] = best['macd_fast']
+                                st.session_state['best_macd_slow'] = best['macd_slow']
+                                st.session_state['best_macd_signal'] = best['macd_signal']
+
+                            st.write(f"Return: **{best['total_return']:.2f}%**, Sharpe: **{best['sharpe']:.2f}**, Max DD: **{best['max_drawdown']:.2f}%**")
+
+                            # Visualization of results
+                            if len(results) > 1:
+                                st.markdown("### Parameter Performance Heatmap")
+                                pivot_data = pd.DataFrame(results)
+
+                                if strategy_type == "SMA Crossover":
+                                    # Create pivot table for heatmap
+                                    if len(pivot_data) > 0:
+                                        pivot = pivot_data.pivot_table(
+                                            values='total_return',
+                                            index='slow_sma',
+                                            columns='fast_sma',
+                                            aggfunc='first'
+                                        )
+                                        fig = go.Figure(data=go.Heatmap(
+                                            z=pivot.values,
+                                            x=pivot.columns,
+                                            y=pivot.index,
+                                            colorscale='RdYlGn',
+                                            text=np.round(pivot.values, 1),
+                                            texttemplate="%{text}%",
+                                            textfont={"size": 10},
+                                            hovertemplate="Fast SMA: %{x}<br>Slow SMA: %{y}<br>Return: %{z:.2f}%<extra></extra>"
+                                        ))
+                                        fig.update_layout(
+                                            title="Return % by SMA Combination",
+                                            xaxis_title="Fast SMA",
+                                            yaxis_title="Slow SMA",
+                                            template='plotly_dark',
+                                            height=400
+                                        )
+                                        st.plotly_chart(fig, use_container_width=True, config=CHART_CONFIG)
+
+                                elif strategy_type == "RSI Mean Reversion":
+                                    # For RSI, show heatmap of oversold vs overbought (averaged across periods)
+                                    if len(pivot_data) > 0:
+                                        pivot = pivot_data.pivot_table(
+                                            values='total_return',
+                                            index='rsi_overbought',
+                                            columns='rsi_oversold',
+                                            aggfunc='mean'  # Average across different periods
+                                        )
+                                        fig = go.Figure(data=go.Heatmap(
+                                            z=pivot.values,
+                                            x=pivot.columns,
+                                            y=pivot.index,
+                                            colorscale='RdYlGn',
+                                            text=np.round(pivot.values, 1),
+                                            texttemplate="%{text}%",
+                                            textfont={"size": 10},
+                                            hovertemplate="Oversold: %{x}<br>Overbought: %{y}<br>Avg Return: %{z:.2f}%<extra></extra>"
+                                        ))
+                                        fig.update_layout(
+                                            title="Avg Return % by RSI Levels (across all periods)",
+                                            xaxis_title="Oversold Level",
+                                            yaxis_title="Overbought Level",
+                                            template='plotly_dark',
+                                            height=400
+                                        )
+                                        st.plotly_chart(fig, use_container_width=True, config=CHART_CONFIG)
+
+                                        # Also show period impact
+                                        period_perf = pivot_data.groupby('rsi_period')['total_return'].mean().reset_index()
+                                        fig2 = go.Figure(data=go.Bar(
+                                            x=period_perf['rsi_period'],
+                                            y=period_perf['total_return'],
+                                            marker_color='#26a69a',
+                                            text=period_perf['total_return'].round(1),
+                                            texttemplate="%{text}%",
+                                            textposition='outside'
+                                        ))
+                                        fig2.update_layout(
+                                            title="Avg Return % by RSI Period",
+                                            xaxis_title="RSI Period",
+                                            yaxis_title="Avg Return %",
+                                            template='plotly_dark',
+                                            height=300
+                                        )
+                                        st.plotly_chart(fig2, use_container_width=True, config=CHART_CONFIG)
+
+                                elif strategy_type == "MACD Signal":
+                                    # For MACD, show heatmap of fast vs slow (averaged across signal periods)
+                                    if len(pivot_data) > 0:
+                                        pivot = pivot_data.pivot_table(
+                                            values='total_return',
+                                            index='macd_slow',
+                                            columns='macd_fast',
+                                            aggfunc='mean'  # Average across different signal periods
+                                        )
+                                        fig = go.Figure(data=go.Heatmap(
+                                            z=pivot.values,
+                                            x=pivot.columns,
+                                            y=pivot.index,
+                                            colorscale='RdYlGn',
+                                            text=np.round(pivot.values, 1),
+                                            texttemplate="%{text}%",
+                                            textfont={"size": 10},
+                                            hovertemplate="Fast: %{x}<br>Slow: %{y}<br>Avg Return: %{z:.2f}%<extra></extra>"
+                                        ))
+                                        fig.update_layout(
+                                            title="Avg Return % by MACD Fast/Slow (across all signal periods)",
+                                            xaxis_title="Fast Period",
+                                            yaxis_title="Slow Period",
+                                            template='plotly_dark',
+                                            height=400
+                                        )
+                                        st.plotly_chart(fig, use_container_width=True, config=CHART_CONFIG)
+
+                                        # Also show signal period impact
+                                        sig_perf = pivot_data.groupby('macd_signal')['total_return'].mean().reset_index()
+                                        fig2 = go.Figure(data=go.Bar(
+                                            x=sig_perf['macd_signal'],
+                                            y=sig_perf['total_return'],
+                                            marker_color='#26a69a',
+                                            text=sig_perf['total_return'].round(1),
+                                            texttemplate="%{text}%",
+                                            textposition='outside'
+                                        ))
+                                        fig2.update_layout(
+                                            title="Avg Return % by MACD Signal Period",
+                                            xaxis_title="Signal Period",
+                                            yaxis_title="Avg Return %",
+                                            template='plotly_dark',
+                                            height=300
+                                        )
+                                        st.plotly_chart(fig2, use_container_width=True, config=CHART_CONFIG)
+
+                        else:
+                            st.warning("No valid parameter combinations found. Try adjusting the ranges.")
+
+                except Exception as e:
+                    st.error(f"Error during optimization: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
+
+    if not optimize_mode:
+        if st.button("Run Backtest", type="primary", key="bt_run"):
+            with st.spinner("Running backtest..."):
+                try:
+                    # Get data
+                    if data_source == "Fetch from Yahoo":
+                        df, error = safe_yf_download(bt_symbol, start=bt_start, end=bt_end)
+                        if error:
+                            st.error(error)
+                            st.stop()
+                    else:
+                        df = pd.read_parquet(os.path.join(DATA_DIR, f"{bt_dataset}.parquet"))
+
+                    if df is None or df.empty:
+                        st.error("No data available. Please check the symbol and date range, or try again later.")
+                    else:
+                        # Generate signals
+                        if strategy_type == "SMA Crossover":
+                            df['fast'] = ta.sma(df['Close'], length=fast_sma)
+                            df['slow'] = ta.sma(df['Close'], length=slow_sma)
                             df['signal'] = 0
-                            df.loc[df['rsi'] < 30, 'signal'] = 1
-                            df.loc[df['rsi'] > 70, 'signal'] = -1
-                        except Exception as e:
-                            logger.error(f"Custom strategy error: {e}")
-                            st.error("Could not parse custom strategy. Please use predefined strategies.")
+                            df.loc[df['fast'] > df['slow'], 'signal'] = 1
+                            df.loc[df['fast'] < df['slow'], 'signal'] = -1
 
-                    # Run backtest
-                    df = df.dropna()
-                    df['position'] = df['signal'].shift(1).fillna(0)  # Enter next day
-                    df['returns'] = df['Close'].pct_change()
-                    df['strategy_returns'] = df['position'] * df['returns']
+                        elif strategy_type == "RSI Mean Reversion":
+                            df['rsi'] = ta.rsi(df['Close'], length=rsi_period)
+                            df['signal'] = 0
+                            df.loc[df['rsi'] < rsi_oversold, 'signal'] = 1
+                            df.loc[df['rsi'] > rsi_overbought, 'signal'] = -1
 
-                    # Account for commission on trades
-                    df['trade'] = df['position'].diff().abs()
-                    df['commission_cost'] = df['trade'] * commission / initial_capital
-                    df['strategy_returns'] = df['strategy_returns'] - df['commission_cost']
+                        elif strategy_type == "MACD Signal":
+                            macd = ta.macd(df['Close'], fast=macd_fast, slow=macd_slow, signal=macd_signal)
+                            df['macd'] = macd[f'MACD_{macd_fast}_{macd_slow}_{macd_signal}']
+                            df['macd_signal'] = macd[f'MACDs_{macd_fast}_{macd_slow}_{macd_signal}']
+                            df['signal'] = 0
+                            df.loc[df['macd'] > df['macd_signal'], 'signal'] = 1
+                            df.loc[df['macd'] < df['macd_signal'], 'signal'] = -1
 
-                    # Calculate equity curve
-                    df['equity'] = initial_capital * (1 + df['strategy_returns']).cumprod()
-                    df['buy_hold'] = initial_capital * (1 + df['returns']).cumprod()
+                        else:  # Custom - using safe expression evaluation
+                            # Parse custom code for safe indicator-based signals
+                            # Only allows predefined indicator comparisons, not arbitrary code
+                            st.warning("Custom strategies use a restricted syntax for security. Use predefined strategies for best results.")
+                            try:
+                                # Default to RSI-based strategy for custom
+                                df['rsi'] = ta.rsi(df['Close'], length=14)
+                                df['signal'] = 0
+                                df.loc[df['rsi'] < 30, 'signal'] = 1
+                                df.loc[df['rsi'] > 70, 'signal'] = -1
+                            except Exception as e:
+                                logger.error(f"Custom strategy error: {e}")
+                                st.error("Could not parse custom strategy. Please use predefined strategies.")
 
-                    # Performance metrics
-                    total_return = (df['equity'].iloc[-1] / initial_capital - 1) * 100
-                    buy_hold_return = (df['buy_hold'].iloc[-1] / initial_capital - 1) * 100
-                    sharpe = df['strategy_returns'].mean() / df['strategy_returns'].std() * np.sqrt(252) if df['strategy_returns'].std() > 0 else 0
-                    max_dd = ((df['equity'] / df['equity'].cummax()) - 1).min() * 100
-                    win_rate = (df[df['strategy_returns'] > 0]['strategy_returns'].count() /
-                               df[df['strategy_returns'] != 0]['strategy_returns'].count() * 100) if df[df['strategy_returns'] != 0]['strategy_returns'].count() > 0 else 0
-                    num_trades = df['trade'].sum() / 2
+                        # Run backtest
+                        df = df.dropna()
+                        df['position'] = df['signal'].shift(1).fillna(0)  # Enter next day
+                        df['returns'] = df['Close'].pct_change()
+                        df['strategy_returns'] = df['position'] * df['returns']
 
-                    # Display results
-                    st.markdown("### Results")
-                    col1, col2, col3, col4 = st.columns(4)
-                    with col1:
-                        st.metric("Strategy Return", f"{total_return:.2f}%")
-                    with col2:
-                        st.metric("Buy & Hold Return", f"{buy_hold_return:.2f}%")
-                    with col3:
-                        st.metric("Sharpe Ratio", f"{sharpe:.2f}")
-                    with col4:
-                        st.metric("Max Drawdown", f"{max_dd:.2f}%")
+                        # Account for commission on trades
+                        df['trade'] = df['position'].diff().abs()
+                        df['commission_cost'] = df['trade'] * commission / initial_capital
+                        df['strategy_returns'] = df['strategy_returns'] - df['commission_cost']
 
-                    col1, col2, col3, col4 = st.columns(4)
-                    with col1:
-                        st.metric("Win Rate", f"{win_rate:.1f}%")
-                    with col2:
-                        st.metric("# Trades", f"{int(num_trades)}")
-                    with col3:
-                        st.metric("Final Equity", f"${df['equity'].iloc[-1]:,.0f}")
-                    with col4:
-                        alpha = total_return - buy_hold_return
-                        st.metric("Alpha", f"{alpha:.2f}%")
+                        # Calculate equity curve
+                        df['equity'] = initial_capital * (1 + df['strategy_returns']).cumprod()
+                        df['buy_hold'] = initial_capital * (1 + df['returns']).cumprod()
 
-                    # Equity curve
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(x=df.index, y=df['equity'], name='Strategy', line=dict(color='#26a69a')))
-                    fig.add_trace(go.Scatter(x=df.index, y=df['buy_hold'], name='Buy & Hold', line=dict(color='#ef5350')))
-                    fig.update_layout(title='Equity Curve', template='plotly_dark', height=400,
-                                     yaxis_title='Portfolio Value ($)', xaxis_title='Date')
-                    st.plotly_chart(fig, use_container_width=True, config=CHART_CONFIG)
+                        # Performance metrics
+                        total_return = (df['equity'].iloc[-1] / initial_capital - 1) * 100
+                        buy_hold_return = (df['buy_hold'].iloc[-1] / initial_capital - 1) * 100
+                        sharpe = df['strategy_returns'].mean() / df['strategy_returns'].std() * np.sqrt(252) if df['strategy_returns'].std() > 0 else 0
+                        max_dd = ((df['equity'] / df['equity'].cummax()) - 1).min() * 100
+                        win_rate = (df[df['strategy_returns'] > 0]['strategy_returns'].count() /
+                                   df[df['strategy_returns'] != 0]['strategy_returns'].count() * 100) if df[df['strategy_returns'] != 0]['strategy_returns'].count() > 0 else 0
+                        num_trades = df['trade'].sum() / 2
 
-                    # Drawdown
-                    df['drawdown'] = (df['equity'] / df['equity'].cummax() - 1) * 100
-                    fig2 = go.Figure()
-                    fig2.add_trace(go.Scatter(x=df.index, y=df['drawdown'], fill='tozeroy',
-                                             fillcolor='rgba(239, 83, 80, 0.3)', line=dict(color='#ef5350')))
-                    fig2.update_layout(title='Drawdown', template='plotly_dark', height=250,
-                                      yaxis_title='Drawdown (%)', xaxis_title='Date')
-                    st.plotly_chart(fig2, use_container_width=True, config=CHART_CONFIG)
+                        # Display results
+                        st.markdown("### Results")
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("Strategy Return", f"{total_return:.2f}%")
+                        with col2:
+                            st.metric("Buy & Hold Return", f"{buy_hold_return:.2f}%")
+                        with col3:
+                            st.metric("Sharpe Ratio", f"{sharpe:.2f}")
+                        with col4:
+                            st.metric("Max Drawdown", f"{max_dd:.2f}%")
 
-            except Exception as e:
-                st.error(f"Error: {e}")
-                import traceback
-                st.code(traceback.format_exc())
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("Win Rate", f"{win_rate:.1f}%")
+                        with col2:
+                            st.metric("# Trades", f"{int(num_trades)}")
+                        with col3:
+                            st.metric("Final Equity", f"${df['equity'].iloc[-1]:,.0f}")
+                        with col4:
+                            alpha = total_return - buy_hold_return
+                            st.metric("Alpha", f"{alpha:.2f}%")
+
+                        # Equity curve
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(x=df.index, y=df['equity'], name='Strategy', line=dict(color='#26a69a')))
+                        fig.add_trace(go.Scatter(x=df.index, y=df['buy_hold'], name='Buy & Hold', line=dict(color='#ef5350')))
+                        fig.update_layout(title='Equity Curve', template='plotly_dark', height=400,
+                                         yaxis_title='Portfolio Value ($)', xaxis_title='Date')
+                        st.plotly_chart(fig, use_container_width=True, config=CHART_CONFIG)
+
+                        # Drawdown
+                        df['drawdown'] = (df['equity'] / df['equity'].cummax() - 1) * 100
+                        fig2 = go.Figure()
+                        fig2.add_trace(go.Scatter(x=df.index, y=df['drawdown'], fill='tozeroy',
+                                                 fillcolor='rgba(239, 83, 80, 0.3)', line=dict(color='#ef5350')))
+                        fig2.update_layout(title='Drawdown', template='plotly_dark', height=250,
+                                          yaxis_title='Drawdown (%)', xaxis_title='Date')
+                        st.plotly_chart(fig2, use_container_width=True, config=CHART_CONFIG)
+
+                except Exception as e:
+                    st.error(f"Error: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
 
 
 # ============================================================================
